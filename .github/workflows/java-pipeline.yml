@@ -101,3 +101,5 @@ jobs:
           echo "- **Java Version**: ${{ github.event.inputs.java_version || github.event.client_payload.java_version || '21' }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Maven Goals**: ${{ github.event.inputs.maven_goals || github.event.client_payload.maven_goals || 'clean install' }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Build Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+
+# CI registration touch (no functional change): ensures GitHub indexes this workflow for workflow_dispatch.
