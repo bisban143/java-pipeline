@@ -1,28 +1,43 @@
 name: Java Build and Run Pipeline
 
+# This pipeline builds and runs a Java project checked out from a target
+# repository. It auto-detects the project type so that BOTH conventional
+# Maven projects AND minimal single-file Java programs (a default-package
+# program at the repository root, e.g. HelloWorld.java) are supported.
+#
+#   * Maven projects (a pom.xml is present)  -> mvn <goals> + java -jar <artifact>
+#   * Single-file Java (no pom.xml, *.java)  -> javac <sources> + java <MainClass>
+#
+# The single-file path exists specifically to validate dependency-free,
+# build-tool-free deliverables (see bisban143/empty-repo HelloWorld.java),
+# which must NOT carry a pom.xml. The two validation gates for such a project
+# are exactly: `javac HelloWorld.java` (compile) and `java HelloWorld` (run,
+# printing `Hello, World!`).
+
 on:
   workflow_dispatch:
     inputs:
       repository:
         description: 'Target repository (owner/repo)'
-        required: true
+        required: false
+        default: 'bisban143/empty-repo'
         type: string
       branch:
         description: 'Branch to build'
         required: false
-        default: 'main'
+        default: 'master'
         type: string
       java_version:
         description: 'Java version'
         required: false
-        default: '21'
+        default: '17'
         type: choice
         options:
           - '11'
           - '17'
           - '21'
       maven_goals:
-        description: 'Maven goals to execute'
+        description: 'Maven goals to execute (Maven projects only)'
         required: false
         default: 'clean install'
         type: string
@@ -31,6 +46,11 @@ on:
         required: false
         default: true
         type: boolean
+      environment:
+        description: 'Deployment environment label (informational; accepted for compatibility with documented dispatch payloads)'
+        required: false
+        default: 'staging'
+        type: string
 
   repository_dispatch:
     types: [java-build-trigger]
@@ -43,63 +63,128 @@ jobs:
       - name: Checkout target repository
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.event.inputs.repository || github.event.client_payload.repository }}
-          ref: ${{ github.event.inputs.branch || github.event.client_payload.branch || 'main' }}
+          repository: ${{ github.event.inputs.repository || github.event.client_payload.repository || 'bisban143/empty-repo' }}
+          ref: ${{ github.event.inputs.branch || github.event.client_payload.branch || 'master' }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      # NOTE: `cache: 'maven'` was intentionally removed. The cache key is
+      # derived from **/pom.xml; on a dependency-free single-file project there
+      # is no pom.xml, which made this step fail before any compile/run gate.
       - name: Set up JDK
         uses: actions/setup-java@v4
         with:
-          java-version: ${{ github.event.inputs.java_version || github.event.client_payload.java_version || '21' }}
+          java-version: ${{ github.event.inputs.java_version || github.event.client_payload.java_version || '17' }}
           distribution: 'temurin'
-          cache: 'maven'
+
+      - name: Detect project type
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          if find . -name 'pom.xml' -not -path './.git/*' | grep -q .; then
+            echo "build_type=maven" >> "$GITHUB_OUTPUT"
+            echo "Detected Maven project (pom.xml present)."
+          elif find . -name '*.java' -not -path './.git/*' | grep -q .; then
+            echo "build_type=single-file" >> "$GITHUB_OUTPUT"
+            echo "Detected single-file Java project (no pom.xml; .java source present)."
+          else
+            echo "build_type=none" >> "$GITHUB_OUTPUT"
+            echo "No pom.xml and no .java files found."
+          fi
 
       - name: Display Java version
+        shell: bash
         run: |
-          echo "Java version:"
+          echo "Java runtime version:"
           java -version
           echo ""
-          echo "Maven version:"
-          mvn -version
+          echo "Java compiler version:"
+          javac -version
 
+      # ---------------------------------------------------------------------
+      # Maven path (preserved for conventional Maven projects)
+      # ---------------------------------------------------------------------
       - name: Build with Maven
+        if: ${{ steps.detect.outputs.build_type == 'maven' }}
+        shell: bash
         run: |
           echo "Building with Maven goals: ${{ github.event.inputs.maven_goals || github.event.client_payload.maven_goals || 'clean install' }}"
           mvn ${{ github.event.inputs.maven_goals || github.event.client_payload.maven_goals || 'clean install' }}
 
       - name: Find JAR file
         id: find-jar
-        if: ${{ (github.event.inputs.run_application == 'true' || github.event.client_payload.run_application == true) }}
+        if: ${{ steps.detect.outputs.build_type == 'maven' && (github.event.inputs.run_application == 'true' || github.event.client_payload.run_application == true) }}
+        shell: bash
         run: |
           JAR_FILE=$(find target -name "*.jar" -not -name "*-sources.jar" -not -name "*-javadoc.jar" | head -n 1)
-          echo "jar_file=$JAR_FILE" >> $GITHUB_OUTPUT
+          echo "jar_file=$JAR_FILE" >> "$GITHUB_OUTPUT"
           echo "Found JAR: $JAR_FILE"
 
-      - name: Run Java application
-        if: ${{ (github.event.inputs.run_application == 'true' || github.event.client_payload.run_application == true) && steps.find-jar.outputs.jar_file != '' }}
+      - name: Run Maven application
+        if: ${{ steps.detect.outputs.build_type == 'maven' && (github.event.inputs.run_application == 'true' || github.event.client_payload.run_application == true) && steps.find-jar.outputs.jar_file != '' }}
+        shell: bash
         run: |
           echo "Running application..."
           java -jar ${{ steps.find-jar.outputs.jar_file }}
 
+      # ---------------------------------------------------------------------
+      # Single-file path (dependency-free, default-package programs)
+      # Compile gate:  javac HelloWorld.java
+      # Run gate:      java HelloWorld   ->  Hello, World!
+      # ---------------------------------------------------------------------
+      - name: Compile single-file Java program
+        if: ${{ steps.detect.outputs.build_type == 'single-file' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Compiling single-file Java project (no build tool)..."
+          mapfile -t JAVA_FILES < <(find . -name '*.java' -not -path './.git/*' | sort)
+          echo "Source files: ${JAVA_FILES[*]}"
+          javac "${JAVA_FILES[@]}"
+          echo "Compilation succeeded (exit 0)."
+
+      - name: Run single-file Java application
+        if: ${{ steps.detect.outputs.build_type == 'single-file' && (github.event.inputs.run_application == 'true' || github.event.client_payload.run_application == true) }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Locate the class that declares the JVM entry point (default package).
+          MAIN_FILE=$(grep -rls --include='*.java' 'public static void main' . | grep -v '/\.git/' | head -n 1)
+          if [ -z "$MAIN_FILE" ]; then
+            echo "::error::No 'public static void main' entry point found among .java sources."
+            exit 1
+          fi
+          MAIN_CLASS=$(basename "$MAIN_FILE" .java)
+          echo "Running: java ${MAIN_CLASS}"
+          java "${MAIN_CLASS}"
+
+      - name: No buildable project found
+        if: ${{ steps.detect.outputs.build_type == 'none' }}
+        shell: bash
+        run: |
+          echo "::error::No pom.xml and no .java files were found in the target repository/branch. Nothing to build or run."
+          exit 1
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
-        if: always()
+        if: ${{ always() && steps.detect.outputs.build_type == 'maven' }}
         with:
           name: build-artifacts
           path: |
             target/*.jar
             target/surefire-reports/
+          if-no-files-found: ignore
           retention-days: 7
 
       - name: Build summary
         if: always()
+        shell: bash
         run: |
-          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Repository**: ${{ github.event.inputs.repository || github.event.client_payload.repository }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Branch**: ${{ github.event.inputs.branch || github.event.client_payload.branch || 'main' }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Java Version**: ${{ github.event.inputs.java_version || github.event.client_payload.java_version || '21' }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Maven Goals**: ${{ github.event.inputs.maven_goals || github.event.client_payload.maven_goals || 'clean install' }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Build Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
-
-# CI registration touch (no functional change): ensures GitHub indexes this workflow for workflow_dispatch.
+          echo "## Build Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Repository**: ${{ github.event.inputs.repository || github.event.client_payload.repository || 'bisban143/empty-repo' }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Branch**: ${{ github.event.inputs.branch || github.event.client_payload.branch || 'master' }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Java Version**: ${{ github.event.inputs.java_version || github.event.client_payload.java_version || '17' }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Environment**: ${{ github.event.inputs.environment || 'n/a' }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Detected Build Type**: ${{ steps.detect.outputs.build_type }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Build Status**: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
